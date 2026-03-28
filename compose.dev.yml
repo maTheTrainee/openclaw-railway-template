@@ -11,5 +11,3 @@ services:
       - ENABLE_WEB_TUI=true
     volumes:
       - ./.tmpdata:/data
-
-
