@@ -12,6 +12,7 @@ RUN apt-get update \
     zip \
   && rm -rf /var/lib/apt/lists/*
 
+RUN curl -fsSL https://tailscale.com/install.sh | sh
 RUN npm install -g openclaw@2026.3.28 clawhub@latest
 
 WORKDIR /app

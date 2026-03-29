@@ -8,3 +8,7 @@ restartPolicyType = "on_failure"
 
 [variables]
 PORT = "8080"
+TAILSCALE_HOSTNAME = "openclaw-railway"
+ENABLE_TAILSCALE_SERVE = "false"
+TAILSCALE_SERVE_HTTPS_PORT = "443"
+TAILSCALE_ACCEPT_DNS = "false"
