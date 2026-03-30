@@ -18,12 +18,17 @@ const WORKSPACE_DIR =
   path.join(STATE_DIR, "workspace");
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
+const RAILWAY_PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN?.trim() || "";
+const OPENCLAW_ALLOWED_ORIGINS =
+  process.env.OPENCLAW_ALLOWED_ORIGINS?.trim() || "";
 
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
 const MAX_LOG_FILE_SIZE = 5 * 1024 * 1024;
 const logRingBuffer = [];
 const sseClients = new Set();
+const knownAllowedOrigins = new Set();
+const observedAllowedOrigins = new Set();
 
 function writeLog(level, category, message) {
   const timestamp = new Date().toISOString();
@@ -92,6 +97,7 @@ function resolveGatewayToken() {
 
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
+const TUI_AUTH_COOKIE = "openclaw_tui_auth";
 
 let cachedOpenclawVersion = null;
 let cachedChannelsHelp = null;
@@ -148,18 +154,140 @@ function isConfigured() {
   }
 }
 
-async function syncAllowedOrigins() {
-  const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
-  if (!publicDomain) return;
+function parseJsonSuffix(output) {
+  if (!output) return null;
 
-  const origin = `https://${publicDomain}`;
+  const match = output.match(/(\{[\s\S]*\}|\[[\s\S]*\])\s*$/);
+  if (!match) return null;
+
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function normalizeOrigin(value) {
+  if (!value || typeof value !== "string") return null;
+
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return null;
+    }
+    url.hash = "";
+    url.pathname = "";
+    url.search = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function parseAllowedOrigins(output) {
+  const parsed = parseJsonSuffix(output);
+  if (Array.isArray(parsed)) {
+    return uniqueStrings(
+      parsed
+        .map((value) => (typeof value === "string" ? value.trim() : ""))
+        .filter(Boolean),
+    );
+  }
+
+  return uniqueStrings(
+    output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("http://") || line.startsWith("https://")),
+  );
+}
+
+function getForwardedProto(req) {
+  const forwarded = req.headers["x-forwarded-proto"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket?.encrypted ? "https" : "http";
+}
+
+function getRequestOrigin(req) {
+  const headerOrigin = normalizeOrigin(req.headers.origin);
+  if (headerOrigin) {
+    return headerOrigin;
+  }
+
+  const host = req.headers.host?.trim();
+  if (!host) return null;
+  return normalizeOrigin(`${getForwardedProto(req)}://${host}`);
+}
+
+function isTailscaleOrigin(origin) {
+  try {
+    return new URL(origin).hostname.endsWith(".ts.net");
+  } catch {
+    return false;
+  }
+}
+
+function getConfiguredAllowedOrigins() {
+  const origins = [];
+
+  if (RAILWAY_PUBLIC_DOMAIN) {
+    origins.push(`https://${RAILWAY_PUBLIC_DOMAIN}`);
+  }
+
+  for (const raw of OPENCLAW_ALLOWED_ORIGINS.split(",")) {
+    const origin = normalizeOrigin(raw);
+    if (origin) {
+      origins.push(origin);
+    }
+  }
+
+  return uniqueStrings(origins);
+}
+
+function shouldTrackAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (getConfiguredAllowedOrigins().includes(origin)) return true;
+  return isTailscaleOrigin(origin);
+}
+
+async function syncAllowedOrigins(extraOrigins = []) {
+  const desiredOrigins = uniqueStrings([
+    ...getConfiguredAllowedOrigins(),
+    ...observedAllowedOrigins,
+    ...extraOrigins
+      .map((origin) => normalizeOrigin(origin))
+      .filter((origin) => shouldTrackAllowedOrigin(origin)),
+  ]);
+
+  const missingOrigins = desiredOrigins.filter(
+    (origin) => !knownAllowedOrigins.has(origin),
+  );
+  if (missingOrigins.length === 0) {
+    return { updated: false, origins: desiredOrigins };
+  }
 
   const current = await runCmd(
     OPENCLAW_NODE,
     clawArgs(["config", "get", "gateway.controlUi.allowedOrigins"]),
   );
-  if (current.code === 0 && current.output.includes(origin)) {
-    return;
+  const currentOrigins =
+    current.code === 0 ? parseAllowedOrigins(current.output) : [];
+  const mergedOrigins = uniqueStrings([...currentOrigins, ...desiredOrigins]);
+  const changed =
+    mergedOrigins.length !== currentOrigins.length ||
+    mergedOrigins.some((origin, index) => origin !== currentOrigins[index]);
+
+  if (!changed) {
+    for (const origin of mergedOrigins) {
+      knownAllowedOrigins.add(origin);
+    }
+    return { updated: false, origins: mergedOrigins };
   }
 
   const result = await runCmd(
@@ -169,14 +297,118 @@ async function syncAllowedOrigins() {
       "set",
       "--json",
       "gateway.controlUi.allowedOrigins",
-      JSON.stringify([origin]),
+      JSON.stringify(mergedOrigins),
     ]),
   );
   if (result.code === 0) {
-    log.info("gateway", `set allowedOrigins to [${origin}]`);
-  } else {
-    log.warn("gateway", `failed to set allowedOrigins (exit=${result.code})`);
+    for (const origin of mergedOrigins) {
+      knownAllowedOrigins.add(origin);
+    }
+    log.info("gateway", `set allowedOrigins to ${JSON.stringify(mergedOrigins)}`);
+    return { updated: true, origins: mergedOrigins };
   }
+
+  log.warn("gateway", `failed to set allowedOrigins (exit=${result.code})`);
+  return { updated: false, origins: currentOrigins };
+}
+
+function createSignedToken(scope, ttlMs) {
+  const expiresAt = Date.now() + ttlMs;
+  const nonce = crypto.randomBytes(8).toString("hex");
+  const payload = `${scope}:${expiresAt}:${nonce}`;
+  const payloadBase64 = Buffer.from(payload, "utf8").toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", OPENCLAW_GATEWAY_TOKEN)
+    .update(payloadBase64)
+    .digest("base64url");
+  return `${payloadBase64}.${signature}`;
+}
+
+function verifySignedToken(token, scope) {
+  if (!token || typeof token !== "string") return false;
+
+  const [payloadBase64, signature] = token.split(".");
+  if (!payloadBase64 || !signature) return false;
+
+  const expectedSignature = crypto
+    .createHmac("sha256", OPENCLAW_GATEWAY_TOKEN)
+    .update(payloadBase64)
+    .digest();
+
+  let receivedSignature;
+  try {
+    receivedSignature = Buffer.from(signature, "base64url");
+  } catch {
+    return false;
+  }
+
+  if (
+    receivedSignature.length !== expectedSignature.length ||
+    !crypto.timingSafeEqual(receivedSignature, expectedSignature)
+  ) {
+    return false;
+  }
+
+  let payload;
+  try {
+    payload = Buffer.from(payloadBase64, "base64url").toString("utf8");
+  } catch {
+    return false;
+  }
+
+  const [tokenScope, expiresAtRaw] = payload.split(":");
+  const expiresAt = Number.parseInt(expiresAtRaw, 10);
+  if (tokenScope !== scope || Number.isNaN(expiresAt)) {
+    return false;
+  }
+
+  return Date.now() <= expiresAt;
+}
+
+function parseCookies(headerValue) {
+  if (!headerValue) return {};
+
+  return Object.fromEntries(
+    headerValue
+      .split(";")
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const index = part.indexOf("=");
+        if (index === -1) return [part, ""];
+        return [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
+      }),
+  );
+}
+
+function buildCookie(name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+
+  if (options.maxAge !== undefined) {
+    parts.push(`Max-Age=${options.maxAge}`);
+  }
+  if (options.path) {
+    parts.push(`Path=${options.path}`);
+  }
+  if (options.httpOnly) {
+    parts.push("HttpOnly");
+  }
+  if (options.sameSite) {
+    parts.push(`SameSite=${options.sameSite}`);
+  }
+  if (options.secure) {
+    parts.push("Secure");
+  }
+
+  return parts.join("; ");
+}
+
+function rememberAllowedOrigin(req) {
+  const origin = getRequestOrigin(req);
+  if (shouldTrackAllowedOrigin(origin)) {
+    observedAllowedOrigins.add(origin);
+  }
+  return origin;
 }
 
 let gatewayProc = null;
@@ -394,6 +626,8 @@ function requireSetupAuth(req, res, next) {
         "SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.",
       );
   }
+
+  rememberAllowedOrigin(req);
 
   const ip = req.ip || req.socket?.remoteAddress || "unknown";
   if (setupRateLimiter.isRateLimited(ip)) {
@@ -1243,6 +1477,18 @@ app.get("/tui", requireSetupAuth, (_req, res) => {
   if (!isConfigured()) {
     return res.redirect("/setup");
   }
+
+  res.setHeader(
+    "Set-Cookie",
+    buildCookie(TUI_AUTH_COOKIE, createSignedToken("tui", 5 * 60_000), {
+      path: "/tui",
+      httpOnly: true,
+      sameSite: "Lax",
+      secure: getForwardedProto(_req) === "https",
+      maxAge: 5 * 60,
+    }),
+  );
+
   res.sendFile(path.join(process.cwd(), "src", "public", "tui.html"));
 });
 
@@ -1252,13 +1498,19 @@ function verifyTuiAuth(req) {
   if (!SETUP_PASSWORD) return false;
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) return false;
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  return crypto.timingSafeEqual(passwordHash, expectedHash);
+  if (scheme === "Basic" && encoded) {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+    const passwordHash = crypto.createHash("sha256").update(password).digest();
+    const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+    if (crypto.timingSafeEqual(passwordHash, expectedHash)) {
+      return true;
+    }
+  }
+
+  const cookies = parseCookies(req.headers.cookie);
+  return verifySignedToken(cookies[TUI_AUTH_COOKIE], "tui");
 }
 
 function createTuiWebSocketServer(httpServer) {
@@ -1400,20 +1652,35 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
-const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
-  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+const PROXY_ORIGIN = RAILWAY_PUBLIC_DOMAIN
+  ? `https://${RAILWAY_PUBLIC_DOMAIN}`
   : GATEWAY_TARGET;
+
+async function ensureRequestOriginAllowed(req) {
+  if (!isConfigured()) return;
+
+  const origin = getRequestOrigin(req);
+  if (!shouldTrackAllowedOrigin(origin) || knownAllowedOrigins.has(origin)) {
+    return;
+  }
+
+  const { updated } = await syncAllowedOrigins([origin]);
+  if (updated && gatewayProc && !gatewayStarting) {
+    log.info("gateway", `restarting to apply allowed origin ${origin}`);
+    await restartGateway();
+  }
+}
 
 proxy.on("proxyReq", (proxyReq, req, res) => {
   if (!req.url?.startsWith("/hooks/")) {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   }
-  proxyReq.setHeader("Origin", PROXY_ORIGIN);
+  proxyReq.setHeader("Origin", getRequestOrigin(req) || PROXY_ORIGIN);
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
-  proxyReq.setHeader("Origin", PROXY_ORIGIN);
+  proxyReq.setHeader("Origin", getRequestOrigin(req) || PROXY_ORIGIN);
 });
 
 app.use(async (req, res) => {
@@ -1440,6 +1707,12 @@ app.use(async (req, res) => {
           .status(503)
           .sendFile(path.join(process.cwd(), "src", "public", "loading.html"));
       }
+    }
+
+    try {
+      await ensureRequestOriginAllowed(req);
+    } catch (err) {
+      log.warn("gateway", `failed to sync request origin: ${err.message}`);
     }
   }
 
@@ -1508,6 +1781,7 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
   try {
+    await ensureRequestOriginAllowed(req);
     await ensureGatewayRunning();
   } catch (err) {
     log.warn("websocket", `gateway not ready: ${err.message}`);
