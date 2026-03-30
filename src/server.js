@@ -1492,9 +1492,35 @@ app.get("/tui", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "tui.html"));
 });
 
+app.get("/tui/token", requireSetupAuth, (_req, res) => {
+  if (!ENABLE_WEB_TUI) {
+    return res.status(403).json({
+      ok: false,
+      error: "Web TUI is disabled. Set ENABLE_WEB_TUI=true to enable it.",
+    });
+  }
+  if (!isConfigured()) {
+    return res.status(409).json({
+      ok: false,
+      error: "OpenClaw is not configured yet.",
+    });
+  }
+
+  return res.json({
+    ok: true,
+    token: createSignedToken("tui", 2 * 60_000),
+  });
+});
+
 let activeTuiSession = null;
 
 function verifyTuiAuth(req) {
+  const url = new URL(req.url, "http://localhost");
+  const queryToken = url.searchParams.get("token");
+  if (verifySignedToken(queryToken, "tui")) {
+    return true;
+  }
+
   if (!SETUP_PASSWORD) return false;
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");

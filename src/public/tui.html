@@ -116,18 +116,43 @@
     const container = document.getElementById('terminal-container');
     term.open(container);
 
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${location.host}/tui/ws`;
-
     let ws;
     let reconnectAttempts = 0;
     const maxReconnectAttempts = 3;
 
-    function connect() {
+    async function fetchTuiToken() {
+      const res = await fetch('/tui/token', {
+        credentials: 'same-origin'
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      if (!data.ok || !data.token) {
+        throw new Error(data.error || 'Failed to get TUI token');
+      }
+
+      return data.token;
+    }
+
+    async function connect() {
       setStatus('connecting', 'Connecting...');
       sessionStarted = false;
       loadingOverlay.style.display = 'flex';
-      ws = new WebSocket(wsUrl);
+
+      try {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const token = await fetchTuiToken();
+        const wsUrl = `${protocol}//${location.host}/tui/ws?token=${encodeURIComponent(token)}`;
+        ws = new WebSocket(wsUrl);
+      } catch (error) {
+        setStatus('error', 'Connection error');
+        showError('Authentication Required', String(error));
+        return;
+      }
 
       ws.onopen = () => {
         setStatus('connected', 'Connected');
