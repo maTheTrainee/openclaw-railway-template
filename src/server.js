@@ -25,6 +25,7 @@ const OPENCLAW_ALLOWED_ORIGINS =
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
 const MAX_LOG_FILE_SIZE = 5 * 1024 * 1024;
+const SETUP_RUN_OUTPUT_MAX = 200_000;
 const logRingBuffer = [];
 const sseClients = new Set();
 const knownAllowedOrigins = new Set();
@@ -206,6 +207,24 @@ function parseAllowedOrigins(output) {
   );
 }
 
+function parseConfiguredAllowedOriginsEnv(value) {
+  if (!value) return [];
+
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return uniqueStrings(parsed.map((entry) => normalizeOrigin(entry)).filter(Boolean));
+    }
+  } catch {}
+
+  return uniqueStrings(
+    value
+      .split(",")
+      .map((entry) => normalizeOrigin(entry))
+      .filter(Boolean),
+  );
+}
+
 function getForwardedProto(req) {
   const forwarded = req.headers["x-forwarded-proto"];
   if (typeof forwarded === "string" && forwarded.trim()) {
@@ -240,12 +259,7 @@ function getConfiguredAllowedOrigins() {
     origins.push(`https://${RAILWAY_PUBLIC_DOMAIN}`);
   }
 
-  for (const raw of OPENCLAW_ALLOWED_ORIGINS.split(",")) {
-    const origin = normalizeOrigin(raw);
-    if (origin) {
-      origins.push(origin);
-    }
-  }
+  origins.push(...parseConfiguredAllowedOriginsEnv(OPENCLAW_ALLOWED_ORIGINS));
 
   return uniqueStrings(origins);
 }
@@ -651,6 +665,40 @@ function requireSetupAuth(req, res, next) {
     return res.status(401).send("Invalid password");
   }
   return next();
+}
+
+function trimSetupOutput(output) {
+  if (output.length <= SETUP_RUN_OUTPUT_MAX) return output;
+  return `[output truncated]\n${output.slice(-SETUP_RUN_OUTPUT_MAX)}`;
+}
+
+function createSetupRunState(overrides = {}) {
+  return {
+    status: "idle",
+    ok: false,
+    output: "",
+    startedAt: null,
+    finishedAt: null,
+    ...overrides,
+  };
+}
+
+let setupRun = createSetupRunState();
+
+function appendSetupOutput(chunk = "") {
+  if (!chunk) return;
+  setupRun.output = trimSetupOutput(`${setupRun.output}${chunk}`);
+}
+
+function getSetupRunSnapshot() {
+  return {
+    status: setupRun.status,
+    ok: setupRun.ok,
+    output: setupRun.output,
+    startedAt: setupRun.startedAt,
+    finishedAt: setupRun.finishedAt,
+    configured: isConfigured(),
+  };
 }
 
 const app = express();
@@ -1126,35 +1174,42 @@ function validatePayload(payload) {
   return null;
 }
 
-app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
-  try {
-    if (isConfigured()) {
-      await ensureGatewayRunning();
-      return res.json({
-        ok: true,
-        output:
-          "Already configured.\nUse Reset setup if you want to rerun onboarding.\n",
-      });
-    }
+async function configureChannel(name, cfgObj) {
+  const set = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs([
+      "config",
+      "set",
+      "--json",
+      `channels.${name}`,
+      JSON.stringify(cfgObj),
+    ]),
+  );
+  const get = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["config", "get", `channels.${name}`]),
+  );
+  return (
+    `\n[${name} config] exit=${set.code} (output ${set.output.length} chars)\n${set.output || "(no output)"}` +
+    `\n[${name} verify] exit=${get.code} (output ${get.output.length} chars)\n${get.output || "(no output)"}`
+  );
+}
 
+async function executeSetupRun(payload) {
+  try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
-    const payload = req.body || {};
-    const validationError = validatePayload(payload);
-    if (validationError) {
-      return res.status(400).json({ ok: false, output: validationError });
-    }
     const onboardArgs = buildOnboardArgs(payload);
+    appendSetupOutput(`[setup] Starting onboarding at ${new Date().toISOString()}\n`);
     const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
-
-    let extra = "";
-    extra += `\n[setup] Onboarding exit=${onboard.code} configured=${isConfigured()}\n`;
+    appendSetupOutput(onboard.output || "");
+    appendSetupOutput(`\n[setup] Onboarding exit=${onboard.code} configured=${isConfigured()}\n`);
 
     const ok = onboard.code === 0 && isConfigured();
 
     if (ok) {
-      extra += "\n[setup] Configuring gateway settings...\n";
+      appendSetupOutput("\n[setup] Configuring gateway settings...\n");
 
       const allowInsecureResult = await runCmd(
         OPENCLAW_NODE,
@@ -1165,7 +1220,9 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           "true",
         ]),
       );
-      extra += `[config] gateway.controlUi.allowInsecureAuth=true exit=${allowInsecureResult.code}\n`;
+      appendSetupOutput(
+        `[config] gateway.controlUi.allowInsecureAuth=true exit=${allowInsecureResult.code}\n`,
+      );
 
       const tokenResult = await runCmd(
         OPENCLAW_NODE,
@@ -1176,7 +1233,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           OPENCLAW_GATEWAY_TOKEN,
         ]),
       );
-      extra += `[config] gateway.auth.token exit=${tokenResult.code}\n`;
+      appendSetupOutput(`[config] gateway.auth.token exit=${tokenResult.code}\n`);
 
       const proxiesResult = await runCmd(
         OPENCLAW_NODE,
@@ -1188,76 +1245,124 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           '["127.0.0.1"]',
         ]),
       );
-      extra += `[config] gateway.trustedProxies exit=${proxiesResult.code}\n`;
+      appendSetupOutput(`[config] gateway.trustedProxies exit=${proxiesResult.code}\n`);
 
       if (payload.model?.trim()) {
-        extra += `[setup] Setting model to ${payload.model.trim()}...\n`;
+        appendSetupOutput(`[setup] Setting model to ${payload.model.trim()}...\n`);
         const modelResult = await runCmd(
           OPENCLAW_NODE,
           clawArgs(["models", "set", payload.model.trim()]),
         );
-        extra += `[models set] exit=${modelResult.code}\n${modelResult.output || ""}`;
-      }
-
-      async function configureChannel(name, cfgObj) {
-        const set = await runCmd(
-          OPENCLAW_NODE,
-          clawArgs([
-            "config",
-            "set",
-            "--json",
-            `channels.${name}`,
-            JSON.stringify(cfgObj),
-          ]),
-        );
-        const get = await runCmd(
-          OPENCLAW_NODE,
-          clawArgs(["config", "get", `channels.${name}`]),
-        );
-        return (
-          `\n[${name} config] exit=${set.code} (output ${set.output.length} chars)\n${set.output || "(no output)"}` +
-          `\n[${name} verify] exit=${get.code} (output ${get.output.length} chars)\n${get.output || "(no output)"}`
-        );
+        appendSetupOutput(`[models set] exit=${modelResult.code}\n${modelResult.output || ""}`);
       }
 
       if (payload.telegramToken?.trim()) {
-        extra += await configureChannel("telegram", {
+        appendSetupOutput(await configureChannel("telegram", {
           enabled: true,
           dmPolicy: "pairing",
           botToken: payload.telegramToken.trim(),
           groupPolicy: "open",
           streamMode: "partial",
-        });
+        }));
       }
 
       if (payload.discordToken?.trim()) {
-        extra += await configureChannel("discord", {
+        appendSetupOutput(await configureChannel("discord", {
           enabled: true,
           token: payload.discordToken.trim(),
           groupPolicy: "open",
           dm: { policy: "pairing" },
-        });
+        }));
       }
 
       if (payload.slackBotToken?.trim() || payload.slackAppToken?.trim()) {
-        extra += await configureChannel("slack", {
+        appendSetupOutput(await configureChannel("slack", {
           enabled: true,
           botToken: payload.slackBotToken?.trim() || undefined,
           appToken: payload.slackAppToken?.trim() || undefined,
-        });
+        }));
       }
 
-      extra += "\n[setup] Starting gateway...\n";
+      appendSetupOutput("\n[setup] Starting gateway...\n");
       await restartGateway();
-      extra += "[setup] Gateway started.\n";
+      appendSetupOutput("[setup] Gateway started.\n");
     }
 
-    return res.status(ok ? 200 : 500).json({
+    setupRun = createSetupRunState({
+      status: ok ? "completed" : "failed",
       ok,
-      output: `${onboard.output}${extra}`,
+      output: setupRun.output,
+      startedAt: setupRun.startedAt,
+      finishedAt: new Date().toISOString(),
     });
   } catch (err) {
     log.error("setup", `run error: ${String(err)}`);
+    appendSetupOutput(`\nInternal error: ${String(err)}\n`);
+    setupRun = createSetupRunState({
+      status: "failed",
+      ok: false,
+      output: setupRun.output,
+      startedAt: setupRun.startedAt,
+      finishedAt: new Date().toISOString(),
+    });
+  }
+}
+
+app.get("/setup/api/run", requireSetupAuth, async (_req, res) => {
+  const status = getSetupRunSnapshot();
+  return res.status(status.status === "running" ? 202 : 200).json(status);
+});
+
+app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
+  try {
+    if (setupRun.status === "running") {
+      return res.status(202).json({
+        ok: true,
+        started: false,
+        ...getSetupRunSnapshot(),
+      });
+    }
+
+    if (isConfigured()) {
+      await ensureGatewayRunning();
+      setupRun = createSetupRunState({
+        status: "completed",
+        ok: true,
+        output:
+          "Already configured.\nUse Reset setup if you want to rerun onboarding.\n",
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+      });
+      return res.json({
+        ok: true,
+        started: false,
+        ...getSetupRunSnapshot(),
+      });
+    }
+
+    const payload = req.body || {};
+    const validationError = validatePayload(payload);
+    if (validationError) {
+      return res.status(400).json({ ok: false, output: validationError });
+    }
+
+    setupRun = createSetupRunState({
+      status: "running",
+      ok: false,
+      output: "Running...\n",
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+    });
+
+    void executeSetupRun(payload);
+
+    return res.status(202).json({
+      ok: true,
+      started: true,
+      ...getSetupRunSnapshot(),
+    });
+  } catch (err) {
+    log.error("setup", `run start error: ${String(err)}`);
     return res
       .status(500)
       .json({ ok: false, output: `Internal error: ${String(err)}` });
@@ -1319,6 +1424,7 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
     }
     await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
     fs.rmSync(configPath(), { force: true });
+    setupRun = createSetupRunState();
     res
       .type("text/plain")
       .send("OK - stopped gateway and deleted config file. You can rerun setup now.");

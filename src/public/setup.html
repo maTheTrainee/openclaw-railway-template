@@ -33,6 +33,7 @@
       model: '',
       log: '',
       loading: false,
+      runPollTimer: null,
       pairingChannel: '',
       pairingCode: '',
       showPairingModal: false,
@@ -52,6 +53,7 @@
 
       async init() {
         await this.refreshStatus();
+        await this.resumeSetupRun();
       },
 
       async httpJson(url, opts = {}) {
@@ -85,6 +87,53 @@
           this.status = 'Error: ' + String(e);
           this.isReady = true;
         }
+      },
+
+      stopSetupPolling() {
+        if (this.runPollTimer) {
+          clearTimeout(this.runPollTimer);
+          this.runPollTimer = null;
+        }
+      },
+
+      async resumeSetupRun() {
+        try {
+          const j = await this.httpJson('/setup/api/run');
+          if (j.output) {
+            this.log = j.output;
+          }
+          if (j.status === 'running') {
+            this.loading = true;
+            await this.pollSetupRun();
+          }
+        } catch (_e) {}
+      },
+
+      async pollSetupRun() {
+        this.stopSetupPolling();
+
+        const tick = async () => {
+          try {
+            const j = await this.httpJson('/setup/api/run');
+            this.log = j.output || this.log;
+
+            if (j.status === 'running') {
+              this.loading = true;
+              this.runPollTimer = setTimeout(() => {
+                this.pollSetupRun();
+              }, 1000);
+              return;
+            }
+
+            this.loading = false;
+            await this.refreshStatus();
+          } catch (e) {
+            this.loading = false;
+            this.log += '\nPolling error: ' + String(e) + '\n';
+          }
+        };
+
+        await tick();
       },
 
       updateAuthChoices() {
@@ -121,23 +170,22 @@
 
         this.log = 'Running...\n';
         this.loading = true;
+        this.stopSetupPolling();
 
         try {
-          const res = await fetch('/setup/api/run', {
+          const j = await this.httpJson('/setup/api/run', {
             method: 'POST',
-            credentials: 'same-origin',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify(payload)
           });
-          const text = await res.text();
-          let j;
-          try { j = JSON.parse(text); } catch (_e) { j = { ok: false, output: text }; }
-          this.log += (j.output || JSON.stringify(j, null, 2));
-          await this.refreshStatus();
+          this.log = j.output || this.log;
+          await this.pollSetupRun();
         } catch (e) {
           this.log += '\nError: ' + String(e) + '\n';
         } finally {
-          this.loading = false;
+          if (!this.runPollTimer) {
+            this.loading = false;
+          }
         }
       },
 
@@ -190,6 +238,7 @@
         if (!confirm('Reset setup? This deletes the config file so onboarding can run again.')) return;
         this.log = 'Resetting...\n';
         this.loading = true;
+        this.stopSetupPolling();
 
         try {
           const res = await fetch('/setup/api/reset', { method: 'POST', credentials: 'same-origin' });
