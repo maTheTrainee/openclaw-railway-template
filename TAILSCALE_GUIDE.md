@@ -29,6 +29,7 @@ Notes:
 - if `TAILSCALE_AUTHKEY` is missing, the app starts normally without Tailscale
 - `TAILSCALE_HOSTNAME` controls the machine name in your tailnet
 - `ENABLE_TAILSCALE_SERVE=true` enables HTTPS exposure through Tailscale Serve
+- `TAILSCALE_ACCEPT_DNS` only controls whether this container accepts DNS settings from the tailnet; it does not advertise Railway DNS names into Tailscale
 
 ## 3. Deploy
 
@@ -37,6 +38,7 @@ Redeploy the Railway service after saving the variables.
 On startup the container will:
 - start `tailscaled`
 - run `tailscale up`
+- print the node's tailnet IP and hostname into the Railway logs
 - optionally run `tailscale serve`
 - then start the OpenClaw wrapper
 
@@ -45,10 +47,14 @@ On startup the container will:
 If you only enabled tailnet networking:
 - connect your own device to Tailscale
 - open the machine on port 8080 inside the tailnet
+- use the tailnet IP from the Railway logs or the hostname you configured with `TAILSCALE_HOSTNAME`
 
 If you enabled Tailscale Serve:
 - connect your own device to Tailscale
 - open the generated tailnet HTTPS URL
+- the URL comes from the Tailscale node name in your tailnet, not from Railway's public domain
+
+No Tailscale admin popup is expected for "advertising Railway DNS addresses" because this template does not advertise Railway DNS records at all.
 
 ## 5. Make it private-only
 
@@ -66,4 +72,5 @@ After confirming Tailscale access works, you can disable the public Railway netw
 
 ### HTTPS URL does not exist
 - set `ENABLE_TAILSCALE_SERVE=true`
+- make sure MagicDNS / tailnet HTTPS is enabled in your Tailscale tailnet
 - redeploy the service
